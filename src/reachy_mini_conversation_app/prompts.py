@@ -12,6 +12,23 @@ logger = logging.getLogger(__name__)
 PROMPTS_LIBRARY_DIRECTORY = Path(__file__).parent / "prompts"
 INSTRUCTIONS_FILENAME = "instructions.txt"
 VOICE_FILENAME = "voice.txt"
+GLOBAL_TOOL_GUIDANCE = """
+
+## CURRENT INFO RULES
+When the web_search tool is available and the user asks for current, local, or fast-changing information
+such as weather, news, restaurants, opening hours, schedules, prices, sports, or live events, use it
+instead of guessing from memory.
+Use web_search for recommendations that depend on freshness or local availability.
+""".strip()
+GLOBAL_MEMORY_GUIDANCE = """
+
+## MEMORY RULES
+Use remember_fact for durable user facts, preferences, relationships, routines, recurring projects, or explicit
+"remember this" requests.
+Use recall_memory when prior context could help.
+Use forget_memory when the user asks you to forget or correct saved information.
+Do not store secrets, temporary chatter, or one-off details unless the user explicitly asks.
+""".strip()
 
 
 def _expand_prompt_includes(content: str) -> str:
@@ -58,7 +75,7 @@ def _expand_prompt_includes(content: str) -> str:
     return '\n'.join(expanded_lines)
 
 
-def get_session_instructions() -> str:
+def get_session_instructions(user_id: str | None = None) -> str:
     """Get session instructions, loading from REACHY_MINI_CUSTOM_PROFILE if set."""
     profile = config.REACHY_MINI_CUSTOM_PROFILE
     if not profile:
@@ -81,7 +98,21 @@ def get_session_instructions() -> str:
             if instructions:
                 # Expand [<name>] placeholders with content from prompts library
                 expanded_instructions = _expand_prompt_includes(instructions)
-                return expanded_instructions
+                memory_block = ""
+                try:
+                    from reachy_mini_conversation_app.memory import MemoryStore, get_default_memory_user_id
+
+                    memory_block = MemoryStore().format_for_prompt(
+                        user_id=(user_id or get_default_memory_user_id()),
+                        limit=config.REACHY_MINI_MEMORY_PROMPT_LIMIT,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to load stored memory into prompt: %s", e)
+
+                parts = [expanded_instructions, GLOBAL_TOOL_GUIDANCE, GLOBAL_MEMORY_GUIDANCE]
+                if memory_block:
+                    parts.append(memory_block)
+                return "\n\n".join(parts)
             logger.error(f"Profile '{profile}' has empty {INSTRUCTIONS_FILENAME}")
             sys.exit(1)
         logger.error(f"Profile {profile} has no {INSTRUCTIONS_FILENAME}")

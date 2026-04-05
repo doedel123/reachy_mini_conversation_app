@@ -125,6 +125,13 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU builds‚Ä
 |----------|-------------|
 | `OPENAI_API_KEY` | Required. Grants access to the OpenAI realtime endpoint. |
 | `MODEL_NAME` | Override the realtime model (defaults to `gpt-realtime`). Used for both conversation and vision (unless `--local-vision` flag is used). |
+| `WEB_SEARCH_MODEL` | Model used for the `web_search` tool (defaults to `gpt-5-mini`). |
+| `REACHY_MINI_IDLE_SESSION_TIMEOUT_S` | Auto-sleep timeout for the realtime session after inactivity, in seconds (defaults to `300`). |
+| `REACHY_MINI_MEMORY_DB_PATH` | SQLite path for durable memory storage (defaults to `./data/reachy_memory.sqlite3`). |
+| `REACHY_MINI_MEMORY_USER_ID` | Default fallback memory identity before the user introduces themselves (defaults to `default`). |
+| `REACHY_MINI_MEMORY_PROMPT_LIMIT` | Maximum number of stored memories injected into the session prompt (defaults to `12`). |
+| `REACHY_MINI_MEMORY_AUTO_SUMMARIZE` | Enable automatic memory extraction after completed turns (defaults to `true`). |
+| `REACHY_MINI_MEMORY_SUMMARIZER_MODEL` | Cheap side model used to condense durable memories (defaults to `gpt-5-mini`). |
 | `HF_HOME` | Cache directory for local Hugging Face downloads (only used with `--local-vision` flag, defaults to `./cache`). |
 | `HF_TOKEN` | Optional token for Hugging Face access (for gated/private assets). |
 | `LOCAL_VISION_MODEL` | Hugging Face model path for local vision processing (only used with `--local-vision` flag, defaults to `HuggingFaceTB/SmolVLM2-2.2B-Instruct`). |
@@ -187,8 +194,35 @@ reachy-mini-conversation-app --gradio
 | `play_emotion` | Play a recorded emotion clip via Hugging Face datasets. | Core install only. Uses the default open emotions dataset: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library). |
 | `stop_emotion` | Clear queued emotions. | Core install only. |
 | `do_nothing` | Explicitly remain idle. | Core install only. |
+| `web_search` | Search the live web for current or local information such as weather, news, restaurants, opening hours, schedules, prices, or events. | Requires `OPENAI_API_KEY`. Uses `WEB_SEARCH_MODEL` (defaults to `gpt-5-mini`). |
 
 ## Advanced features
+
+### Web search for current information
+
+When the `web_search` tool is enabled in the active profile, Reachy can look up live information instead of guessing from static model knowledge.
+
+- It is intended for current or location-sensitive questions such as weather, news, restaurants, opening hours, events, and recommendations.
+- The assistant prompt explicitly tells the model to prefer `web_search` for fast-changing or local information.
+- Search runs through the OpenAI Responses API and uses `WEB_SEARCH_MODEL`, which defaults to `gpt-5-mini`.
+
+### RTC session sleep and wake-up
+
+To reduce API cost, the realtime session no longer stays connected forever when nobody is speaking.
+
+- After `REACHY_MINI_IDLE_SESSION_TIMEOUT_S` seconds of inactivity, the live realtime connection is closed automatically.
+- While sleeping, Reachy still monitors incoming microphone audio locally for voice activity.
+- When speech is detected again, the realtime session reconnects automatically and the conversation resumes.
+- This is voice-activity wake-up, not a keyword wakeword such as "Hey Reachy".
+
+### Durable memory and multi-user mode
+
+Reachy can persist durable memories in a local SQLite database and reuse them in later sessions.
+
+- The assistant stores concise user facts, preferences, routines, and recurring project context instead of full chat logs.
+- At the start of a session, the user can switch the active memory identity by saying phrases like `Ich bin Walter`, `Ich hei√üe Walter`, or `My name is Walter`.
+- If the spoken name is new, Reachy automatically starts a new memory profile for that person.
+- Completed turns can also be auto-condensed into durable memories with a small side model (`REACHY_MINI_MEMORY_SUMMARIZER_MODEL`), which defaults to `gpt-5-mini`.
 
 Built-in motion content is published as open Hugging Face datasets:
 - Emotions: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library)

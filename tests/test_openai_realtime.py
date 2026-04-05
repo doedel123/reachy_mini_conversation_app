@@ -315,8 +315,16 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
 
-    # Run: should retry once and exit cleanly
-    await handler.start_up()
+    # Run: should retry once, then remain idle waiting for a reconnect request.
+    start_task = asyncio.create_task(handler.start_up())
+
+    for _ in range(20):
+        if attempt_counter["n"] == 2:
+            break
+        await asyncio.sleep(0.05)
+
+    await handler.shutdown()
+    await asyncio.wait_for(start_task, timeout=2.0)
 
     # Validate: two attempts total (fail -> retry -> succeed), and connection cleared
     assert attempt_counter["n"] == 2

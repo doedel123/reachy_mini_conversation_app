@@ -80,6 +80,32 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return float(raw.strip())
+    except ValueError:
+        logger.warning("Invalid float value for %s=%r, using default=%s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning("Invalid integer value for %s=%r, using default=%s", name, raw, default)
+        return default
+
+
 def _collect_profile_names(profiles_root: Path) -> set[str]:
     """Return profile folder names from a profiles root directory."""
     if not profiles_root.exists() or not profiles_root.is_dir():
@@ -155,11 +181,29 @@ class Config:
 
     # Optional
     MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime")
+    WEB_SEARCH_MODEL = os.getenv("WEB_SEARCH_MODEL", "gpt-5-mini")
+    REACHY_MINI_IDLE_SESSION_TIMEOUT_S = _env_float("REACHY_MINI_IDLE_SESSION_TIMEOUT_S", 300.0)
+    REACHY_MINI_MEMORY_DB_PATH = os.getenv("REACHY_MINI_MEMORY_DB_PATH", "./data/reachy_memory.sqlite3")
+    REACHY_MINI_MEMORY_USER_ID = os.getenv("REACHY_MINI_MEMORY_USER_ID", "default")
+    REACHY_MINI_MEMORY_PROMPT_LIMIT = _env_int("REACHY_MINI_MEMORY_PROMPT_LIMIT", 12)
+    REACHY_MINI_MEMORY_AUTO_SUMMARIZE = _env_flag("REACHY_MINI_MEMORY_AUTO_SUMMARIZE", True)
+    REACHY_MINI_MEMORY_SUMMARIZER_MODEL = os.getenv("REACHY_MINI_MEMORY_SUMMARIZER_MODEL", "gpt-5-mini")
     HF_HOME = os.getenv("HF_HOME", "./cache")
     LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
-    logger.debug(f"Model: {MODEL_NAME}, HF_HOME: {HF_HOME}, Vision Model: {LOCAL_VISION_MODEL}")
+    logger.debug(
+        "Model: %s, Web Search Model: %s, Idle Timeout: %ss, Memory DB: %s, Memory User: %s, Memory Auto Summarize: %s, Memory Summarizer Model: %s, HF_HOME: %s, Vision Model: %s",
+        MODEL_NAME,
+        WEB_SEARCH_MODEL,
+        REACHY_MINI_IDLE_SESSION_TIMEOUT_S,
+        REACHY_MINI_MEMORY_DB_PATH,
+        REACHY_MINI_MEMORY_USER_ID,
+        REACHY_MINI_MEMORY_AUTO_SUMMARIZE,
+        REACHY_MINI_MEMORY_SUMMARIZER_MODEL,
+        HF_HOME,
+        LOCAL_VISION_MODEL,
+    )
 
     # Filesystem root containing profile directories, not a Python import path.
     _profiles_directory_env = os.getenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY")

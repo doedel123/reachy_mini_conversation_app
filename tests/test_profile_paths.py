@@ -69,12 +69,16 @@ def test_prompts_load_from_compact_builtin_profile(monkeypatch: pytest.MonkeyPat
     """Prompt loading should read compact built-in profile instructions directly."""
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "mad_scientist_assistant")
     monkeypatch.setattr(config, "PROFILES_DIRECTORY", DEFAULT_PROFILES_DIRECTORY)
+    monkeypatch.setattr(config, "REACHY_MINI_MEMORY_DB_PATH", "test-memory.sqlite3")
 
     expected = (
         DEFAULT_PROFILES_DIRECTORY / "mad_scientist_assistant" / "instructions.txt"
     ).read_text(encoding="utf-8").strip()
 
-    assert prompts_mod.get_session_instructions() == expected
+    prompt = prompts_mod.get_session_instructions()
+    assert prompt.startswith(expected)
+    assert prompts_mod.GLOBAL_TOOL_GUIDANCE in prompt
+    assert prompts_mod.GLOBAL_MEMORY_GUIDANCE in prompt
     assert read_instructions_for("mad_scientist_assistant") == expected
 
 

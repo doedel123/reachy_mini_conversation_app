@@ -4,6 +4,8 @@ import base64
 import random
 import asyncio
 import logging
+import time
+import re
 from typing import Any, Final, Tuple, Literal, Optional
 from pathlib import Path
 from datetime import datetime
@@ -31,6 +33,8 @@ from openai.types.realtime.realtime_audio_input_turn_detection_param import Serv
 
 from reachy_mini_conversation_app.config import AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
+from reachy_mini_conversation_app.audio.speech_tapper import _rms_dbfs, _to_float32_mono, VAD_DB_ON, ATTACK_FR
+from reachy_mini_conversation_app.memory import MemoryStore, normalize_memory_user_id
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -55,6 +59,14 @@ TEXT_OUTPUT_COST_PER_1M = 16.0
 IMAGE_INPUT_COST_PER_1M = 5.0
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
+_VOICE_WAKE_DB_THRESHOLD: Final[float] = VAD_DB_ON
+_VOICE_WAKE_ATTACK_FRAMES: Final[int] = max(2, ATTACK_FR)
+_MEMORY_SUMMARIZER_MAX_TOKENS: Final[int] = 400
+_USER_INTRO_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"^\s*(?:i am|i'm|my name is)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'._ -]{0,63})\s*[.!?]?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:ich bin|ich hei(?:ß|ss)e|mein name ist)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'._ -]{0,63})\s*[.!?]?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:je suis|mon nom est)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'._ -]{0,63})\s*[.!?]?\s*$", re.IGNORECASE),
+)
 
 
 
@@ -78,6 +90,28 @@ def _compute_response_cost(usage: Any) -> float:
         cost += (getattr(out, "audio_tokens", 0) or 0) * AUDIO_OUTPUT_COST_PER_1M / 1e6
         cost += (getattr(out, "text_tokens", 0) or 0) * TEXT_OUTPUT_COST_PER_1M / 1e6
     return cost
+
+
+def _clean_json_text(raw_text: str) -> str:
+    """Remove optional markdown fences around JSON output."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_introduced_name(transcript: str | None) -> str | None:
+    """Return a user-provided self-introduction name when the transcript matches."""
+    text = (transcript or "").strip()
+    if not text:
+        return None
+
+    for pattern in _USER_INTRO_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            return match.group(1).strip()
+    return None
 
 
 class OpenaiRealtimeHandler(AsyncStreamHandler):
@@ -104,8 +138,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.connection: AsyncRealtimeConnection | None = None
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
 
-        self.last_activity_time = asyncio.get_event_loop().time()
-        self.start_time = asyncio.get_event_loop().time()
+        self.last_activity_time = time.monotonic()
+        self.start_time = time.monotonic()
         self.is_idle_tool_call = False
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
@@ -123,6 +157,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Background tool manager
         self.tool_manager = BackgroundToolManager()
+        self.memory_store = MemoryStore()
+        self.active_memory_user_id = normalize_memory_user_id(
+            deps.active_memory_user_id or getattr(config, "REACHY_MINI_MEMORY_USER_ID", None)
+        )
+        self.deps.active_memory_user_id = self.active_memory_user_id
 
         # Cost tracking
         self.cumulative_cost: float = 0.0
@@ -134,6 +173,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._last_response_rejected: bool = False
+        self._shutdown_requested = False
+        self._reconnect_requested: asyncio.Event = asyncio.Event()
+        self._reconnect_requested.set()
+        self._wake_above_threshold_frames = 0
+        self._memory_summary_tasks: set[asyncio.Task[None]] = set()
+        self._last_user_transcript: str = ""
+        self._last_assistant_transcript: str = ""
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -159,7 +205,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
 
             try:
-                instructions = get_session_instructions()
+                instructions = self._resolve_session_instructions()
                 voice = get_session_voice()
             except BaseException as e:  # catch SystemExit from prompt loader without crashing
                 logger.error("Failed to resolve personality content: %s", e)
@@ -237,31 +283,42 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await self._run_realtime_session()
-                # Normal exit from the session, stop retrying
-                return
-            except ConnectionClosedError as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    # exponential backoff with jitter
-                    base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
-            finally:
-                # never keep a stale reference
-                self.connection = None
+        while not self._shutdown_requested:
+            await self._reconnect_requested.wait()
+            if self._shutdown_requested:
+                break
+
+            self._reconnect_requested.clear()
+
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    self._connected_event.clear()
-                except Exception:
-                    pass
+                    await self._run_realtime_session()
+                    break
+                except ConnectionClosedError as e:
+                    logger.warning(
+                        "Realtime websocket closed unexpectedly (attempt %d/%d): %s",
+                        attempt,
+                        max_attempts,
+                        e,
+                    )
+                    if attempt < max_attempts:
+                        base_delay = 2 ** (attempt - 1)
+                        jitter = random.uniform(0, 0.5)
+                        delay = base_delay + jitter
+                        logger.info("Retrying in %.1f seconds...", delay)
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.warning("Realtime session failed repeatedly; waiting for new speech to reconnect.")
+                finally:
+                    self.connection = None
+                    try:
+                        self._connected_event.clear()
+                    except Exception:
+                        pass
+
+            if not self._shutdown_requested:
+                logger.info("Realtime session inactive; waiting for voice activity to reconnect.")
 
     async def _restart_session(self) -> None:
         """Force-close the current session and start a fresh one in background.
@@ -302,6 +359,147 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         This method never blocks the caller.
         """
         await self._pending_responses.put(kwargs)
+
+    def _resolve_session_instructions(self) -> str:
+        """Resolve prompt instructions, supporting legacy zero-arg test doubles."""
+        try:
+            return get_session_instructions(user_id=self.active_memory_user_id)
+        except TypeError:
+            return get_session_instructions()
+
+    async def _refresh_session_memory_context(self) -> None:
+        """Push current active-user memory into the live realtime session."""
+        if self.connection is None:
+            return
+
+        await self.connection.session.update(
+            session=RealtimeSessionCreateRequestParam(
+                type="realtime",
+                instructions=self._resolve_session_instructions(),
+                audio=RealtimeAudioConfigParam(
+                    output=RealtimeAudioConfigOutputParam(
+                        voice=get_session_voice(),
+                    ),
+                ),
+            ),
+        )
+
+    async def _switch_active_memory_user(self, spoken_name: str) -> str:
+        """Switch the active durable memory identity based on a spoken introduction."""
+        cleaned_name = spoken_name.strip()
+        if not cleaned_name:
+            return self.active_memory_user_id
+
+        new_user_id = normalize_memory_user_id(cleaned_name)
+        self.active_memory_user_id = new_user_id
+        self.deps.active_memory_user_id = new_user_id
+        self.memory_store.remember_fact(
+            user_id=new_user_id,
+            fact=f"The user's name is {cleaned_name}.",
+            category="identity",
+            tags=["name", "self-introduction"],
+        )
+        logger.info("Active memory user switched to %s from spoken intro %r", new_user_id, cleaned_name)
+
+        try:
+            await self._refresh_session_memory_context()
+        except Exception as exc:
+            logger.warning("Failed to refresh session after memory user switch: %s", exc)
+
+        return new_user_id
+
+    def _should_auto_summarize_memory(self, user_transcript: str, assistant_transcript: str) -> bool:
+        """Return whether a completed turn is worth sending to the memory summarizer."""
+        if not config.REACHY_MINI_MEMORY_AUTO_SUMMARIZE:
+            return False
+        if not user_transcript.strip() or not assistant_transcript.strip():
+            return False
+        if len(user_transcript.strip()) < 8:
+            return False
+        return True
+
+    async def _summarize_and_store_memory(
+        self,
+        *,
+        memory_user_id: str,
+        user_transcript: str,
+        assistant_transcript: str,
+    ) -> None:
+        """Use a cheap text model to extract durable memories from a finished turn."""
+        if getattr(self, "client", None) is None:
+            return
+
+        prompt = (
+            "Extract only durable user memory from this conversation turn.\n"
+            "Return strict JSON with this shape: "
+            '{"save":[{"fact":"...", "category":"identity|preference|relationship|routine|project|context|other", "tags":["..."]}]}\n'
+            "Rules:\n"
+            "- Save only stable facts about the user, household, preferences, routines, recurring projects, or durable context.\n"
+            "- Ignore transient small talk, assistant-only claims, jokes, and current web results unless the user says they are a standing preference or project.\n"
+            "- Keep facts concise, factual, and reusable in future sessions.\n"
+            "- If nothing durable should be stored, return {\"save\":[]}.\n\n"
+            f"Active user id: {memory_user_id}\n"
+            f"User: {user_transcript.strip()}\n"
+            f"Assistant: {assistant_transcript.strip()}"
+        )
+
+        try:
+            response = await self.client.responses.create(
+                model=config.REACHY_MINI_MEMORY_SUMMARIZER_MODEL,
+                input=prompt,
+                max_output_tokens=_MEMORY_SUMMARIZER_MAX_TOKENS,
+            )
+            raw_output = (getattr(response, "output_text", "") or "").strip()
+            if not raw_output:
+                return
+
+            payload = json.loads(_clean_json_text(raw_output))
+            items = payload.get("save", [])
+            if not isinstance(items, list):
+                return
+
+            saved_count = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                fact = (item.get("fact") or "").strip()
+                if not fact:
+                    continue
+                self.memory_store.remember_fact(
+                    user_id=memory_user_id,
+                    fact=fact,
+                    category=item.get("category"),
+                    tags=item.get("tags"),
+                )
+                saved_count += 1
+
+            if saved_count:
+                logger.info(
+                    "Stored %d summarized memories for user_id=%s via %s",
+                    saved_count,
+                    memory_user_id,
+                    config.REACHY_MINI_MEMORY_SUMMARIZER_MODEL,
+                )
+        except Exception as exc:
+            logger.warning("Memory summarization failed for user_id=%s: %s", memory_user_id, exc)
+
+    def _schedule_memory_summary(self, *, user_transcript: str, assistant_transcript: str) -> None:
+        """Run memory summarization in background so speech flow is not blocked."""
+        if not self._should_auto_summarize_memory(user_transcript, assistant_transcript):
+            return
+
+        memory_user_id = self.active_memory_user_id
+
+        task = asyncio.create_task(
+            self._summarize_and_store_memory(
+                memory_user_id=memory_user_id,
+                user_transcript=user_transcript,
+                assistant_transcript=assistant_transcript,
+            ),
+            name="memory-summarizer",
+        )
+        self._memory_summary_tasks.add(task)
+        task.add_done_callback(self._memory_summary_tasks.discard)
 
     async def _response_sender_loop(self) -> None:
         """Dedicated worker that sends ``response.create()`` calls serially.
@@ -382,6 +580,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return
 
         try:
+            # A finished tool still counts as recent activity. This prevents the
+            # idle routine from racing against the tool follow-up response.
+            self.last_activity_time = asyncio.get_event_loop().time()
+
             # TODO: refactor this since it's repeated here, in the camera branch below, and in send_idle_signal
             if isinstance(bg_tool.id, str):
                 await self.connection.conversation.item.create(
@@ -458,13 +660,81 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self.connection = None
             self._response_done_event.set()
 
+    def _has_pending_assistant_work(self) -> bool:
+        """Return whether the assistant still owes the user a response."""
+        if not self._response_done_event.is_set():
+            return True
+        if not self._pending_responses.empty():
+            return True
+        if self.tool_manager.get_running_tools():
+            return True
+        return False
+
+    def _should_auto_sleep_session(self, idle_duration: float) -> bool:
+        """Return whether the realtime session should sleep due to inactivity."""
+        timeout_s = float(config.REACHY_MINI_IDLE_SESSION_TIMEOUT_S)
+        if timeout_s <= 0:
+            return False
+        if idle_duration < timeout_s:
+            return False
+        return not self._has_pending_assistant_work()
+
+    async def _sleep_session_due_to_inactivity(self, idle_duration: float) -> None:
+        """Close the live realtime session after extended inactivity."""
+        if not self.connection:
+            return
+
+        logger.info(
+            "Closing realtime session after %.1fs of inactivity to reduce API usage.",
+            idle_duration,
+        )
+        self.last_activity_time = asyncio.get_event_loop().time()
+        self._wake_above_threshold_frames = 0
+        await self.connection.close()
+
+    def _voice_activity_detected(self, audio_frame: NDArray[np.int16]) -> bool:
+        """Best-effort local VAD to wake a sleeping realtime session."""
+        mono = _to_float32_mono(audio_frame)
+        if mono.size == 0:
+            self._wake_above_threshold_frames = 0
+            return False
+
+        if _rms_dbfs(mono) >= _VOICE_WAKE_DB_THRESHOLD:
+            self._wake_above_threshold_frames += 1
+        else:
+            self._wake_above_threshold_frames = 0
+
+        if self._wake_above_threshold_frames >= _VOICE_WAKE_ATTACK_FRAMES:
+            self._wake_above_threshold_frames = 0
+            return True
+        return False
+
+    async def _ensure_connection_for_voice_activity(self) -> bool:
+        """Request a new realtime session and wait briefly for it to connect."""
+        if self.connection:
+            return True
+        if getattr(self, "client", None) is None or self._shutdown_requested:
+            return False
+
+        if not self._reconnect_requested.is_set():
+            logger.info("Voice activity detected while sleeping; reconnecting realtime session.")
+            self._reconnect_requested.set()
+
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for realtime session reconnect.")
+            return False
+
+        return self.connection is not None
+
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
         async with self.client.realtime.connect(model=config.MODEL_NAME) as conn:
             try:
                 session_config = RealtimeSessionCreateRequestParam(
                     type="realtime",
-                    instructions=get_session_instructions(),
+                    instructions=self._resolve_session_instructions(),
                     audio=RealtimeAudioConfigParam(
                         input=RealtimeAudioConfigInputParam(
                             format=AudioPCM(type="audio/pcm", rate=self.input_sample_rate),
@@ -581,6 +851,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         logger.debug(f"User transcript: {event.transcript}")
+                        self._last_user_transcript = event.transcript or ""
+                        introduced_name = _extract_introduced_name(event.transcript)
+                        if introduced_name:
+                            await self._switch_active_memory_user(introduced_name)
 
                         # Cancel any pending partial emission
                         if self.partial_transcript_task and not self.partial_transcript_task.done():
@@ -595,6 +869,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         logger.debug(f"Assistant transcript: {event.transcript}")
+                        self._last_assistant_transcript = event.transcript or ""
+                        self._schedule_memory_summary(
+                            user_transcript=self._last_user_transcript,
+                            assistant_transcript=self._last_assistant_transcript,
+                        )
                         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
 
                     # Handle audio delta
@@ -685,6 +964,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all patus.
                 await self.tool_manager.shutdown()
+                if self._memory_summary_tasks:
+                    await asyncio.gather(*self._memory_summary_tasks, return_exceptions=True)
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -698,10 +979,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             frame: A tuple containing (sample_rate, audio_data).
 
         """
-        if not self.connection:
-            return
-
         input_sample_rate, audio_frame = frame
+
+        if not self.connection:
+            if not self._voice_activity_detected(audio_frame):
+                return
+            if not await self._ensure_connection_for_voice_activity():
+                return
 
         # Reshape if needed
         if audio_frame.ndim == 2:
@@ -734,7 +1018,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Handle idle
         idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
+        if self._should_auto_sleep_session(idle_duration):
+            try:
+                await self._sleep_session_due_to_inactivity(idle_duration)
+            except Exception as e:
+                logger.warning("Idle sleep skipped (connection closed?): %s", e)
+            return None
+
+        if (
+            idle_duration > 15.0
+            and self.deps.movement_manager.is_idle()
+            and not self._has_pending_assistant_work()
+        ):
             try:
                 await self.send_idle_signal(idle_duration)
             except Exception as e:
@@ -747,6 +1042,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        self._shutdown_requested = True
+        self._reconnect_requested.set()
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
 
@@ -760,6 +1057,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await self.partial_transcript_task
             except asyncio.CancelledError:
                 pass
+
+        if self._memory_summary_tasks:
+            for task in list(self._memory_summary_tasks):
+                task.cancel()
+            await asyncio.gather(*self._memory_summary_tasks, return_exceptions=True)
+            self._memory_summary_tasks.clear()
 
         if self.connection:
             try:

@@ -3,5 +3,9 @@ stop_dance
 play_emotion
 stop_emotion
 camera
+web_search
+remember_fact
+recall_memory
+forget_memory
 do_nothing
 move_head
