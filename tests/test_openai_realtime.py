@@ -9,7 +9,11 @@ import pytest
 
 import reachy_mini_conversation_app.openai_realtime as rt_mod
 import reachy_mini_conversation_app.tools.background_tool_manager as btm_mod
-from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler, _compute_response_cost
+from reachy_mini_conversation_app.openai_realtime import (
+    OpenaiRealtimeHandler,
+    _compute_response_cost,
+    _extract_gradio_api_key,
+)
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolCallRoutine
 
@@ -18,6 +22,18 @@ def _build_handler(loop: asyncio.AbstractEventLoop) -> OpenaiRealtimeHandler:
     asyncio.set_event_loop(loop)
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     return OpenaiRealtimeHandler(deps)
+
+
+def test_extract_gradio_api_key_prefers_sk_like_string() -> None:
+    """Gradio stream args should resolve the API key from the textbox, not other UI strings."""
+    args = [object(), [], "example", "sk-test-123", "hype_bot"]
+    assert _extract_gradio_api_key(args) == "sk-test-123"
+
+
+def test_extract_gradio_api_key_falls_back_to_textbox_position() -> None:
+    """Fallback should still support the current stream input ordering."""
+    args = [object(), [], "sk-proj-abc", "example"]
+    assert _extract_gradio_api_key(args) == "sk-proj-abc"
 
 
 @pytest.mark.asyncio

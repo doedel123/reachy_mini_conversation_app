@@ -126,6 +126,7 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU buildsâ€
 | `OPENAI_API_KEY` | Required. Grants access to the OpenAI realtime endpoint. |
 | `MODEL_NAME` | Override the realtime model (defaults to `gpt-realtime`). Used for both conversation and vision (unless `--local-vision` flag is used). |
 | `WEB_SEARCH_MODEL` | Model used for the `web_search` tool (defaults to `gpt-5-mini`). |
+| `REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S` | Timeout for opening the OpenAI realtime websocket, in seconds (defaults to `10`). |
 | `REACHY_MINI_IDLE_SESSION_TIMEOUT_S` | Auto-sleep timeout for the realtime session after inactivity, in seconds (defaults to `300`). |
 | `REACHY_MINI_MEMORY_DB_PATH` | SQLite path for durable memory storage (defaults to `./data/reachy_memory.sqlite3`). |
 | `REACHY_MINI_MEMORY_USER_ID` | Default fallback memory identity before the user introduces themselves (defaults to `default`). |

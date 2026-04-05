@@ -35,6 +35,21 @@ def test_should_auto_sleep_session_honors_timeout(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_sleep_session_sets_sleep_flag_and_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """Auto-sleep should mark the RTC as sleeping and emit a clear log line."""
+    handler = _build_handler()
+    handler.connection = MagicMock()
+    handler.connection.close = AsyncMock()
+
+    with caplog.at_level("INFO"):
+        await handler._sleep_session_due_to_inactivity(321.0)
+
+    assert handler._rtc_sleeping is True
+    handler.connection.close.assert_awaited_once()
+    assert "RTC auto-sleep" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_receive_reconnects_on_voice_activity(monkeypatch: pytest.MonkeyPatch) -> None:
     """When sleeping, incoming speech should request a reconnect."""
     handler = _build_handler()
@@ -48,3 +63,32 @@ async def test_receive_reconnects_on_voice_activity(monkeypatch: pytest.MonkeyPa
     await handler.receive((24000, loud))
 
     ensure_connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_connection_for_voice_activity_clears_sleep_flag() -> None:
+    """Successful wake-up should clear the sleeping flag."""
+    handler = _build_handler()
+    handler._rtc_sleeping = True
+    handler.client = MagicMock()
+    handler.connection = MagicMock()
+    handler._connected_event.set()
+
+    connected = await handler._ensure_connection_for_voice_activity()
+
+    assert connected is True
+    assert handler._rtc_sleeping is False
+
+
+@pytest.mark.asyncio
+async def test_receive_marks_user_activity_after_audio_append() -> None:
+    """User audio should count as activity so auto-sleep does not fire mid-conversation."""
+    handler = _build_handler()
+    handler.connection = MagicMock()
+    handler.connection.input_audio_buffer = MagicMock()
+    handler.connection.input_audio_buffer.append = AsyncMock()
+    handler.last_activity_time = 1.0
+
+    await handler.receive((24000, np.ones(1024, dtype=np.int16)))
+
+    assert handler.last_activity_time > 1.0

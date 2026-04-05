@@ -6,6 +6,9 @@ import asyncio
 import logging
 import time
 import re
+import sys
+import threading
+import traceback
 from typing import Any, Final, Tuple, Literal, Optional
 from pathlib import Path
 from datetime import datetime
@@ -114,6 +117,21 @@ def _extract_introduced_name(transcript: str | None) -> str | None:
     return None
 
 
+def _extract_gradio_api_key(args: list[Any]) -> str | None:
+    """Best-effort extraction of the API key textbox value from Gradio stream args."""
+    string_args = [arg.strip() for arg in args if isinstance(arg, str) and arg.strip()]
+    for candidate in string_args:
+        if candidate.startswith("sk-"):
+            return candidate
+
+    # Fallback to the current UI ordering: [stream, chatbot, api_key_textbox, ...]
+    if len(args) > 2 and isinstance(args[2], str):
+        candidate = args[2].strip()
+        return candidate or None
+
+    return None
+
+
 class OpenaiRealtimeHandler(AsyncStreamHandler):
     """An OpenAI realtime handler for fastrtc Stream."""
 
@@ -176,13 +194,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._shutdown_requested = False
         self._reconnect_requested: asyncio.Event = asyncio.Event()
         self._reconnect_requested.set()
+        self._startup_in_progress = False
         self._wake_above_threshold_frames = 0
+        self._rtc_sleeping = False
+        self._last_sleep_wait_log_time = 0.0
+        self._last_startup_wait_log_time = 0.0
+        self._first_audio_frame_logged = False
         self._memory_summary_tasks: set[asyncio.Task[None]] = set()
         self._last_user_transcript: str = ""
         self._last_assistant_transcript: str = ""
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
+        logger.info("Creating per-connection realtime handler copy (gradio_mode=%s).", self.gradio_mode)
         return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
 
     async def apply_personality(self, profile: str | None) -> str:
@@ -261,18 +285,32 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
+        logger.info(
+            "Realtime handler start_up called (gradio_mode=%s, active_memory_user_id=%s, env_key_present=%s).",
+            self.gradio_mode,
+            self.active_memory_user_id,
+            bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()),
+        )
         openai_api_key = config.OPENAI_API_KEY
         if self.gradio_mode and not openai_api_key:
             # api key was not found in .env or in the environment variables
+            logger.info("OPENAI_API_KEY not found in env; waiting for Gradio textbox args.")
             await self.wait_for_args()  # type: ignore[no-untyped-call]
             args = list(self.latest_args)
-            textbox_api_key = args[3] if len(args[3]) > 0 else None
+            logger.info(
+                "Received Gradio args for API key resolution (arg_count=%d, string_arg_indexes=%s).",
+                len(args),
+                [idx for idx, value in enumerate(args) if isinstance(value, str) and value.strip()],
+            )
+            textbox_api_key = _extract_gradio_api_key(args)
             if textbox_api_key is not None:
                 openai_api_key = textbox_api_key
                 self._key_source = "textbox"
                 self._provided_api_key = textbox_api_key
+                logger.info("Resolved OpenAI API key from Gradio textbox.")
             else:
                 openai_api_key = config.OPENAI_API_KEY
+                logger.warning("Could not resolve OpenAI API key from Gradio textbox args.")
         else:
             if not openai_api_key or not openai_api_key.strip():
                 # In headless console mode, LocalStream now blocks startup until the key is provided.
@@ -280,8 +318,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # To keep tests hermetic without requiring a real key, fall back to a placeholder.
                 logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
                 openai_api_key = "DUMMY"
+            else:
+                logger.info("Using OpenAI API key from environment or .env.")
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
+        logger.info("AsyncOpenAI client initialized (key_source=%s).", self._key_source)
 
         while not self._shutdown_requested:
             await self._reconnect_requested.wait()
@@ -293,6 +334,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
+                    logger.info("Starting realtime session attempt %d/%d.", attempt, max_attempts)
+                    self._startup_in_progress = True
                     await self._run_realtime_session()
                     break
                 except ConnectionClosedError as e:
@@ -310,7 +353,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         await asyncio.sleep(delay)
                         continue
                     logger.warning("Realtime session failed repeatedly; waiting for new speech to reconnect.")
+                except Exception as e:
+                    logger.exception(
+                        "Realtime session failed during connect/startup (attempt %d/%d): %s",
+                        attempt,
+                        max_attempts,
+                        e,
+                    )
+                    if attempt < max_attempts:
+                        base_delay = 2 ** (attempt - 1)
+                        jitter = random.uniform(0, 0.5)
+                        delay = base_delay + jitter
+                        logger.info("Retrying in %.1f seconds after startup failure...", delay)
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.error("Realtime session could not be established; waiting for a new reconnect trigger.")
                 finally:
+                    self._startup_in_progress = False
                     self.connection = None
                     try:
                         self._connected_event.clear()
@@ -359,6 +418,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         This method never blocks the caller.
         """
         await self._pending_responses.put(kwargs)
+
+    def _mark_activity(self) -> None:
+        """Refresh the last-activity timestamp for user or assistant activity."""
+        self.last_activity_time = asyncio.get_event_loop().time()
 
     def _resolve_session_instructions(self) -> str:
         """Resolve prompt instructions, supporting legacy zero-arg test doubles."""
@@ -582,7 +645,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         try:
             # A finished tool still counts as recent activity. This prevents the
             # idle routine from racing against the tool follow-up response.
-            self.last_activity_time = asyncio.get_event_loop().time()
+            self._mark_activity()
 
             # TODO: refactor this since it's repeated here, in the camera branch below, and in send_idle_signal
             if isinstance(bg_tool.id, str):
@@ -684,9 +747,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if not self.connection:
             return
 
+        self._rtc_sleeping = True
         logger.info(
-            "Closing realtime session after %.1fs of inactivity to reduce API usage.",
+            "RTC auto-sleep: closing realtime session after %.1fs of inactivity (timeout=%.1fs, pending_assistant_work=%s).",
             idle_duration,
+            float(config.REACHY_MINI_IDLE_SESSION_TIMEOUT_S),
+            self._has_pending_assistant_work(),
         )
         self.last_activity_time = asyncio.get_event_loop().time()
         self._wake_above_threshold_frames = 0
@@ -699,12 +765,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._wake_above_threshold_frames = 0
             return False
 
-        if _rms_dbfs(mono) >= _VOICE_WAKE_DB_THRESHOLD:
+        level_dbfs = _rms_dbfs(mono)
+        if level_dbfs >= _VOICE_WAKE_DB_THRESHOLD:
             self._wake_above_threshold_frames += 1
         else:
             self._wake_above_threshold_frames = 0
 
         if self._wake_above_threshold_frames >= _VOICE_WAKE_ATTACK_FRAMES:
+            logger.info(
+                "RTC wake trigger: voice activity detected locally (level=%.1f dBFS, threshold=%.1f dBFS, frames=%d).",
+                level_dbfs,
+                _VOICE_WAKE_DB_THRESHOLD,
+                _VOICE_WAKE_ATTACK_FRAMES,
+            )
             self._wake_above_threshold_frames = 0
             return True
         return False
@@ -712,25 +785,69 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def _ensure_connection_for_voice_activity(self) -> bool:
         """Request a new realtime session and wait briefly for it to connect."""
         if self.connection:
+            self._rtc_sleeping = False
             return True
         if getattr(self, "client", None) is None or self._shutdown_requested:
+            logger.debug(
+                "RTC wake skipped: client_ready=%s shutdown_requested=%s",
+                getattr(self, "client", None) is not None,
+                self._shutdown_requested,
+            )
             return False
 
         if not self._reconnect_requested.is_set():
-            logger.info("Voice activity detected while sleeping; reconnecting realtime session.")
+            logger.info("RTC wake-up: voice activity detected while sleeping; reconnecting realtime session.")
             self._reconnect_requested.set()
 
         try:
             await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.warning("Timed out waiting for realtime session reconnect.")
+            logger.warning("RTC wake-up failed: timed out waiting for realtime session reconnect.")
             return False
 
+        self._rtc_sleeping = False
+        logger.info("RTC wake-up complete: realtime session connected again.")
         return self.connection is not None
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
-        async with self.client.realtime.connect(model=config.MODEL_NAME) as conn:
+        connect_timeout_s = float(config.REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S)
+        logger.info(
+            "Opening OpenAI realtime websocket for model=%s (timeout=%.1fs).",
+            config.MODEL_NAME,
+            connect_timeout_s,
+        )
+        manager = self.client.realtime.connect(
+            model=config.MODEL_NAME,
+            websocket_connection_options={"open_timeout": connect_timeout_s},
+        )
+        watchdog = threading.Timer(connect_timeout_s + 2.0, self._log_thread_stacks_during_connect)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            conn = await asyncio.wait_for(manager.__aenter__(), timeout=connect_timeout_s)
+        except TimeoutError as e:
+            logger.error(
+                "OpenAI realtime websocket connect timed out after %.1fs. "
+                "Check network connectivity, firewall/proxy settings, or model availability.",
+                connect_timeout_s,
+            )
+            raise TimeoutError(f"realtime websocket connect timed out after {connect_timeout_s:.1f}s") from e
+        except asyncio.TimeoutError as e:
+            logger.error(
+                "OpenAI realtime websocket connect timed out after %.1fs. "
+                "Check network connectivity, firewall/proxy settings, or model availability.",
+                connect_timeout_s,
+            )
+            raise TimeoutError(f"realtime websocket connect timed out after {connect_timeout_s:.1f}s") from e
+        except Exception:
+            logger.exception("OpenAI realtime websocket connect failed before session initialization.")
+            raise
+        finally:
+            watchdog.cancel()
+
+        try:
+            logger.info("OpenAI realtime websocket connected.")
             try:
                 session_config = RealtimeSessionCreateRequestParam(
                     type="realtime",
@@ -769,10 +886,17 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             # Manage event received from the openai server
             self.connection = conn
+            self._rtc_sleeping = False
             try:
                 self._connected_event.set()
             except Exception:
                 pass
+            logger.info(
+                "RTC session active: model=%s timeout=%.1fs user_id=%s",
+                config.MODEL_NAME,
+                float(config.REACHY_MINI_IDLE_SESSION_TIMEOUT_S),
+                self.active_memory_user_id,
+            )
 
 
             response_sender_task: asyncio.Task[None] | None = None
@@ -788,6 +912,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 async for event in self.connection:
                     logger.debug(f"OpenAI event: {event.type}")
                     if event.type == "input_audio_buffer.speech_started":
+                        self._mark_activity()
                         if hasattr(self, "_clear_queue") and callable(self._clear_queue):
                             self._clear_queue()
                         if self.deps.head_wobbler is not None:
@@ -851,6 +976,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         logger.debug(f"User transcript: {event.transcript}")
+                        self._mark_activity()
                         self._last_user_transcript = event.transcript or ""
                         introduced_name = _extract_introduced_name(event.transcript)
                         if introduced_name:
@@ -869,6 +995,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         logger.debug(f"Assistant transcript: {event.transcript}")
+                        self._mark_activity()
                         self._last_assistant_transcript = event.transcript or ""
                         self._schedule_memory_summary(
                             user_transcript=self._last_user_transcript,
@@ -880,7 +1007,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if event.type == "response.output_audio.delta":
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.feed(event.delta)
-                        self.last_activity_time = asyncio.get_event_loop().time()
+                        self._mark_activity()
                         logger.debug("last activity time updated to %s", self.last_activity_time)
                         await self.output_queue.put(
                             (
@@ -966,6 +1093,33 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await self.tool_manager.shutdown()
                 if self._memory_summary_tasks:
                     await asyncio.gather(*self._memory_summary_tasks, return_exceptions=True)
+                logger.info(
+                    "RTC session loop ended: sleeping=%s shutdown_requested=%s connection_present=%s",
+                    self._rtc_sleeping,
+                    self._shutdown_requested,
+                    self.connection is not None,
+                )
+        finally:
+            await manager.__aexit__(None, None, None)
+
+    def _log_thread_stacks_during_connect(self) -> None:
+        """Dump Python thread stacks when realtime websocket connect appears hung."""
+        try:
+            frames = sys._current_frames()
+        except Exception as exc:
+            logger.error("Realtime connect watchdog failed to capture thread stacks: %s", exc)
+            return
+
+        lines = ["Realtime connect watchdog fired; dumping Python thread stacks."]
+        for thread in threading.enumerate():
+            frame = frames.get(thread.ident or -1)
+            lines.append(f"\n--- Thread {thread.name} (ident={thread.ident}) ---")
+            if frame is None:
+                lines.append("No Python frame available.")
+                continue
+            lines.extend(traceback.format_stack(frame))
+
+        logger.error("\n".join(lines))
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -1007,6 +1161,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         try:
             audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
+            self._mark_activity()
+            if not self._first_audio_frame_logged:
+                logger.info(
+                    "First RTC audio frame received from client (input_rate=%sHz, shape=%s).",
+                    input_sample_rate,
+                    tuple(audio_frame.shape),
+                )
+                self._first_audio_frame_logged = True
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
             return
@@ -1015,9 +1177,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Emit audio frame to be played by the speaker."""
         # sends to the stream the stuff put in the output queue by the openai event handler
         # This is called periodically by the fastrtc Stream
+        now = asyncio.get_event_loop().time()
+
+        if self._startup_in_progress and self.connection is None:
+            if now - self._last_startup_wait_log_time >= 5.0:
+                logger.info("RTC startup in progress: yielding emit loop while realtime websocket connects.")
+                self._last_startup_wait_log_time = now
+            await asyncio.sleep(0.05)
+            return None
+
+        if self._rtc_sleeping and not self.connection and now - self._last_sleep_wait_log_time >= 5.0:
+            logger.info("RTC sleeping: waiting for local voice activity to reconnect.")
+            self._last_sleep_wait_log_time = now
 
         # Handle idle
-        idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
+        idle_duration = now - self.last_activity_time
         if self._should_auto_sleep_session(idle_duration):
             try:
                 await self._sleep_session_due_to_inactivity(idle_duration)

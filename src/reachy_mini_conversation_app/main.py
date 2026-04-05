@@ -173,6 +173,35 @@ def run(
         else:
             app = settings_app
 
+        if args.debug:
+            interesting_prefixes = (
+                "/webrtc/offer",
+                "/websocket/offer",
+                "/component_server",
+                "/gradio_api/stream",
+                "/gradio_api/queue",
+            )
+
+            @app.middleware("http")
+            async def log_gradio_rtc_requests(request, call_next):  # type: ignore[no-untyped-def]
+                path = request.url.path
+                should_log = any(path.startswith(prefix) for prefix in interesting_prefixes)
+                if should_log:
+                    logger.info(
+                        "HTTP %s %s content-type=%s",
+                        request.method,
+                        path,
+                        request.headers.get("content-type"),
+                    )
+                try:
+                    response = await call_next(request)
+                except Exception:
+                    logger.exception("HTTP request failed: %s %s", request.method, path)
+                    raise
+                if should_log:
+                    logger.info("HTTP %s %s -> %s", request.method, path, response.status_code)
+                return response
+
         personality_ui.wire_events(handler, stream_manager)
 
         app = gr.mount_gradio_app(app, stream.ui, path="/")
