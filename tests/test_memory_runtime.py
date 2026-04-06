@@ -55,6 +55,20 @@ async def test_switch_active_memory_user_updates_session_and_store(
     store = MemoryStore(tmp_path / "memory.sqlite3")
     memories = store.recall_memories(user_id="walter", category="identity")
     assert [memory.fact for memory in memories] == ["The user's name is Walter."]
+    assert store.get_last_active_user_id(default="default") == "walter"
+
+
+def test_handler_restores_last_active_memory_user_from_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new handler should reuse the last identified user from the memory DB."""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    store.set_last_active_user_id("Walter")
+
+    handler = _build_handler(tmp_path, monkeypatch)
+
+    assert handler.active_memory_user_id == "walter"
+    assert handler.deps.active_memory_user_id == "walter"
 
 
 @pytest.mark.asyncio

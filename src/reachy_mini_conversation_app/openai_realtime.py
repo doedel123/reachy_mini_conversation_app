@@ -62,9 +62,17 @@ TEXT_OUTPUT_COST_PER_1M = 16.0
 IMAGE_INPUT_COST_PER_1M = 5.0
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
-_VOICE_WAKE_DB_THRESHOLD: Final[float] = VAD_DB_ON
 _VOICE_WAKE_ATTACK_FRAMES: Final[int] = max(2, ATTACK_FR)
 _MEMORY_SUMMARIZER_MAX_TOKENS: Final[int] = 400
+_NOISY_OPENAI_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "response.output_audio.delta",
+        "response.output_audio_transcript.delta",
+        "conversation.item.input_audio_transcription.delta",
+        "response.function_call_arguments.delta",
+        "rate_limits.updated",
+    }
+)
 _USER_INTRO_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"^\s*(?:i am|i'm|my name is)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'._ -]{0,63})\s*[.!?]?\s*$", re.IGNORECASE),
     re.compile(r"^\s*(?:ich bin|ich hei(?:ß|ss)e|mein name ist)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'._ -]{0,63})\s*[.!?]?\s*$", re.IGNORECASE),
@@ -176,10 +184,20 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Background tool manager
         self.tool_manager = BackgroundToolManager()
         self.memory_store = MemoryStore()
-        self.active_memory_user_id = normalize_memory_user_id(
-            deps.active_memory_user_id or getattr(config, "REACHY_MINI_MEMORY_USER_ID", None)
-        )
+        configured_default_user_id = normalize_memory_user_id(getattr(config, "REACHY_MINI_MEMORY_USER_ID", None))
+        deps_memory_user_id = normalize_memory_user_id(deps.active_memory_user_id) if deps.active_memory_user_id else None
+        restored_memory_user_id = self.memory_store.get_last_active_user_id(default=configured_default_user_id)
+        if deps_memory_user_id and deps_memory_user_id != configured_default_user_id:
+            initial_memory_user_id = deps_memory_user_id
+        elif restored_memory_user_id != configured_default_user_id:
+            initial_memory_user_id = restored_memory_user_id
+        else:
+            initial_memory_user_id = deps_memory_user_id or restored_memory_user_id or configured_default_user_id
+
+        self.active_memory_user_id = normalize_memory_user_id(initial_memory_user_id)
         self.deps.active_memory_user_id = self.active_memory_user_id
+        if self.active_memory_user_id != configured_default_user_id:
+            logger.info("Restored active memory user from previous session: %s", self.active_memory_user_id)
 
         # Cost tracking
         self.cumulative_cost: float = 0.0
@@ -196,9 +214,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._reconnect_requested.set()
         self._startup_in_progress = False
         self._wake_above_threshold_frames = 0
+        self._activity_above_threshold_frames = 0
         self._rtc_sleeping = False
         self._last_sleep_wait_log_time = 0.0
         self._last_startup_wait_log_time = 0.0
+        self._last_idle_signal_time = 0.0
+        self._last_activity_frame_log_time = 0.0
+        self._last_audio_level_log_time = 0.0
         self._first_audio_frame_logged = False
         self._memory_summary_tasks: set[asyncio.Task[None]] = set()
         self._last_user_transcript: str = ""
@@ -423,6 +445,59 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Refresh the last-activity timestamp for user or assistant activity."""
         self.last_activity_time = asyncio.get_event_loop().time()
 
+    @staticmethod
+    def _audio_level_dbfs(audio_frame: NDArray[np.int16]) -> float | None:
+        """Return the frame loudness in dBFS for local activity checks."""
+        mono = _to_float32_mono(audio_frame)
+        if mono.size == 0:
+            return None
+        return _rms_dbfs(mono)
+
+    def _audio_frame_has_voice_energy(self, audio_frame: NDArray[np.int16]) -> bool:
+        """Return whether incoming audio looks like real local speech activity."""
+        level_dbfs = self._audio_level_dbfs(audio_frame)
+        threshold_dbfs = float(config.REACHY_MINI_ACTIVITY_DB_THRESHOLD)
+        if level_dbfs is None:
+            self._activity_above_threshold_frames = 0
+            return False
+        if level_dbfs >= threshold_dbfs:
+            self._activity_above_threshold_frames += 1
+        else:
+            self._activity_above_threshold_frames = 0
+        if self._activity_above_threshold_frames >= _VOICE_WAKE_ATTACK_FRAMES:
+            now = asyncio.get_event_loop().time()
+            if now - self._last_activity_frame_log_time >= 5.0:
+                logger.debug(
+                    "Local speech activity detected for idle timer (level=%.1f dBFS, threshold=%.1f dBFS, frames=%d).",
+                    level_dbfs,
+                    threshold_dbfs,
+                    _VOICE_WAKE_ATTACK_FRAMES,
+                )
+                self._last_activity_frame_log_time = now
+            return True
+        return False
+
+    def _maybe_log_local_audio_level(self, level_dbfs: float | None) -> None:
+        """Emit a throttled debug log of the local mic level for threshold tuning."""
+        if level_dbfs is None:
+            return
+
+        now = asyncio.get_event_loop().time()
+        if now - self._last_audio_level_log_time < 5.0:
+            return
+
+        logger.debug(
+            "Local mic level: %.1f dBFS (activity_threshold=%.1f dBFS, wake_threshold=%.1f dBFS, activity_frames=%d, wake_frames=%d, connection=%s, sleeping=%s)",
+            level_dbfs,
+            float(config.REACHY_MINI_ACTIVITY_DB_THRESHOLD),
+            float(config.REACHY_MINI_WAKE_DB_THRESHOLD),
+            self._activity_above_threshold_frames,
+            self._wake_above_threshold_frames,
+            self.connection is not None,
+            self._rtc_sleeping,
+        )
+        self._last_audio_level_log_time = now
+
     def _resolve_session_instructions(self) -> str:
         """Resolve prompt instructions, supporting legacy zero-arg test doubles."""
         try:
@@ -456,6 +531,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         new_user_id = normalize_memory_user_id(cleaned_name)
         self.active_memory_user_id = new_user_id
         self.deps.active_memory_user_id = new_user_id
+        self.memory_store.set_last_active_user_id(new_user_id)
         self.memory_store.remember_fact(
             user_id=new_user_id,
             fact=f"The user's name is {cleaned_name}.",
@@ -645,7 +721,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         try:
             # A finished tool still counts as recent activity. This prevents the
             # idle routine from racing against the tool follow-up response.
-            self._mark_activity()
+            if not bg_tool.is_idle_tool_call:
+                self._mark_activity()
 
             # TODO: refactor this since it's repeated here, in the camera branch below, and in send_idle_signal
             if isinstance(bg_tool.id, str):
@@ -760,13 +837,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     def _voice_activity_detected(self, audio_frame: NDArray[np.int16]) -> bool:
         """Best-effort local VAD to wake a sleeping realtime session."""
-        mono = _to_float32_mono(audio_frame)
-        if mono.size == 0:
+        level_dbfs = self._audio_level_dbfs(audio_frame)
+        wake_threshold_dbfs = float(config.REACHY_MINI_WAKE_DB_THRESHOLD)
+        if level_dbfs is None:
             self._wake_above_threshold_frames = 0
             return False
 
-        level_dbfs = _rms_dbfs(mono)
-        if level_dbfs >= _VOICE_WAKE_DB_THRESHOLD:
+        if level_dbfs >= wake_threshold_dbfs:
             self._wake_above_threshold_frames += 1
         else:
             self._wake_above_threshold_frames = 0
@@ -775,7 +852,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.info(
                 "RTC wake trigger: voice activity detected locally (level=%.1f dBFS, threshold=%.1f dBFS, frames=%d).",
                 level_dbfs,
-                _VOICE_WAKE_DB_THRESHOLD,
+                wake_threshold_dbfs,
                 _VOICE_WAKE_ATTACK_FRAMES,
             )
             self._wake_above_threshold_frames = 0
@@ -910,7 +987,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 )
 
                 async for event in self.connection:
-                    logger.debug(f"OpenAI event: {event.type}")
+                    if event.type not in _NOISY_OPENAI_EVENT_TYPES:
+                        logger.debug(f"OpenAI event: {event.type}")
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity()
                         if hasattr(self, "_clear_queue") and callable(self._clear_queue):
@@ -1156,12 +1234,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
+        self._maybe_log_local_audio_level(self._audio_level_dbfs(audio_frame))
 
         # Send to OpenAI (guard against races during reconnect)
         try:
             audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
-            self._mark_activity()
             if not self._first_audio_frame_logged:
                 logger.info(
                     "First RTC audio frame received from client (input_rate=%sHz, shape=%s).",
@@ -1200,7 +1278,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return None
 
         if (
+            bool(config.REACHY_MINI_ENABLE_IDLE_BEHAVIOR)
+            and
             idle_duration > 15.0
+            and now - self._last_idle_signal_time > 15.0
             and self.deps.movement_manager.is_idle()
             and not self._has_pending_assistant_work()
         ):
@@ -1210,7 +1291,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 logger.warning("Idle signal skipped (connection closed?): %s", e)
                 return None
 
-            self.last_activity_time = asyncio.get_event_loop().time()  # avoid repeated resets
+            self._last_idle_signal_time = now
 
         return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
 
@@ -1322,7 +1403,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def send_idle_signal(self, idle_duration: float) -> None:
         """Send an idle signal to the openai server."""
-        logger.debug("Sending idle signal")
+        logger.info("RTC idle behavior trigger: %.1fs without activity, requesting non-verbal idle action.", idle_duration)
         self.is_idle_tool_call = True
         timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, do nothing, or just be yourself!"
         if not self.connection:

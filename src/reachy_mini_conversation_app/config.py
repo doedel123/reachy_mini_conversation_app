@@ -184,6 +184,9 @@ class Config:
     WEB_SEARCH_MODEL = os.getenv("WEB_SEARCH_MODEL", "gpt-5-mini")
     REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S = _env_float("REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S", 10.0)
     REACHY_MINI_IDLE_SESSION_TIMEOUT_S = _env_float("REACHY_MINI_IDLE_SESSION_TIMEOUT_S", 300.0)
+    REACHY_MINI_ENABLE_IDLE_BEHAVIOR = _env_flag("REACHY_MINI_ENABLE_IDLE_BEHAVIOR", True)
+    REACHY_MINI_ACTIVITY_DB_THRESHOLD = _env_float("REACHY_MINI_ACTIVITY_DB_THRESHOLD", -25.0)
+    REACHY_MINI_WAKE_DB_THRESHOLD = _env_float("REACHY_MINI_WAKE_DB_THRESHOLD", -35.0)
     REACHY_MINI_MEMORY_DB_PATH = os.getenv("REACHY_MINI_MEMORY_DB_PATH", "./data/reachy_memory.sqlite3")
     REACHY_MINI_MEMORY_USER_ID = os.getenv("REACHY_MINI_MEMORY_USER_ID", "default")
     REACHY_MINI_MEMORY_PROMPT_LIMIT = _env_int("REACHY_MINI_MEMORY_PROMPT_LIMIT", 12)
@@ -194,11 +197,14 @@ class Config:
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
     logger.debug(
-        "Model: %s, Web Search Model: %s, Realtime Connect Timeout: %ss, Idle Timeout: %ss, Memory DB: %s, Memory User: %s, Memory Auto Summarize: %s, Memory Summarizer Model: %s, HF_HOME: %s, Vision Model: %s",
+        "Model: %s, Web Search Model: %s, Realtime Connect Timeout: %ss, Idle Timeout: %ss, Idle Behavior: %s, Activity Threshold: %s dBFS, Wake Threshold: %s dBFS, Memory DB: %s, Memory User: %s, Memory Auto Summarize: %s, Memory Summarizer Model: %s, HF_HOME: %s, Vision Model: %s",
         MODEL_NAME,
         WEB_SEARCH_MODEL,
         REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S,
         REACHY_MINI_IDLE_SESSION_TIMEOUT_S,
+        REACHY_MINI_ENABLE_IDLE_BEHAVIOR,
+        REACHY_MINI_ACTIVITY_DB_THRESHOLD,
+        REACHY_MINI_WAKE_DB_THRESHOLD,
         REACHY_MINI_MEMORY_DB_PATH,
         REACHY_MINI_MEMORY_USER_ID,
         REACHY_MINI_MEMORY_AUTO_SUMMARIZE,

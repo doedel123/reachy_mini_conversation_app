@@ -22,6 +22,21 @@ def test_voice_activity_detected_after_multiple_loud_frames() -> None:
     assert handler._voice_activity_detected(loud) is True
 
 
+def test_voice_activity_detected_honors_configured_wake_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wake-up sensitivity should follow the dedicated wake threshold config."""
+    handler = _build_handler()
+    medium = np.ones(1024, dtype=np.float32) * 0.06
+
+    monkeypatch.setattr(rt_mod.config, "REACHY_MINI_WAKE_DB_THRESHOLD", -20.0)
+    assert handler._voice_activity_detected(medium) is False
+    assert handler._voice_activity_detected(medium) is False
+
+    monkeypatch.setattr(rt_mod.config, "REACHY_MINI_WAKE_DB_THRESHOLD", -26.0)
+    handler._wake_above_threshold_frames = 0
+    assert handler._voice_activity_detected(medium) is False
+    assert handler._voice_activity_detected(medium) is True
+
+
 def test_should_auto_sleep_session_honors_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Idle sleep should depend on configured timeout and pending work."""
     handler = _build_handler()
@@ -81,14 +96,43 @@ async def test_ensure_connection_for_voice_activity_clears_sleep_flag() -> None:
 
 
 @pytest.mark.asyncio
-async def test_receive_marks_user_activity_after_audio_append() -> None:
-    """User audio should count as activity so auto-sleep does not fire mid-conversation."""
+async def test_receive_does_not_mark_activity_from_raw_frames_while_connected() -> None:
+    """While connected, raw mic frames should not reset idle timers by themselves."""
     handler = _build_handler()
     handler.connection = MagicMock()
     handler.connection.input_audio_buffer = MagicMock()
     handler.connection.input_audio_buffer.append = AsyncMock()
     handler.last_activity_time = 1.0
 
-    await handler.receive((24000, np.ones(1024, dtype=np.int16)))
+    await handler.receive((24000, np.ones(1024, dtype=np.int16) * 12000))
+    await handler.receive((24000, np.ones(1024, dtype=np.int16) * 12000))
 
-    assert handler.last_activity_time > 1.0
+    assert handler.last_activity_time == 1.0
+
+
+@pytest.mark.asyncio
+async def test_receive_does_not_mark_activity_for_silence() -> None:
+    """Silent mic frames should not keep the realtime session artificially awake."""
+    handler = _build_handler()
+    handler.connection = MagicMock()
+    handler.connection.input_audio_buffer = MagicMock()
+    handler.connection.input_audio_buffer.append = AsyncMock()
+    handler.last_activity_time = 5.0
+
+    await handler.receive((24000, np.zeros(1024, dtype=np.int16)))
+
+    assert handler.last_activity_time == 5.0
+
+
+@pytest.mark.asyncio
+async def test_receive_does_not_mark_activity_for_single_noise_spike() -> None:
+    """One noisy frame should not keep the session alive indefinitely."""
+    handler = _build_handler()
+    handler.connection = MagicMock()
+    handler.connection.input_audio_buffer = MagicMock()
+    handler.connection.input_audio_buffer.append = AsyncMock()
+    handler.last_activity_time = 9.0
+
+    await handler.receive((24000, np.ones(1024, dtype=np.int16) * 12000))
+
+    assert handler.last_activity_time == 9.0

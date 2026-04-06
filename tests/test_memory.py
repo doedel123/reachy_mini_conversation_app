@@ -64,3 +64,16 @@ def test_normalize_memory_user_id() -> None:
     assert normalize_memory_user_id("Walter Voll") == "walter-voll"
     assert normalize_memory_user_id("  Marie-Claire  ") == "marie-claire"
     assert normalize_memory_user_id("") == config.REACHY_MINI_MEMORY_USER_ID
+
+
+def test_memory_store_persists_last_active_user(tmp_path: Path) -> None:
+    """The most recently identified user should survive across app restarts."""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+
+    assert store.get_last_active_user_id(default="default") == "default"
+
+    saved_user_id = store.set_last_active_user_id("Walter Voll")
+    assert saved_user_id == "walter-voll"
+
+    reopened = MemoryStore(tmp_path / "memory.sqlite3")
+    assert reopened.get_last_active_user_id(default="default") == "walter-voll"

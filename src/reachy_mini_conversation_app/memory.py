@@ -15,6 +15,7 @@ from reachy_mini_conversation_app.config import config
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_CATEGORY = "other"
+LAST_ACTIVE_MEMORY_USER_KEY = "last_active_user_id"
 MEMORY_CATEGORIES = (
     "identity",
     "preference",
@@ -126,6 +127,15 @@ class MemoryStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_memories_active_user_updated
                 ON memories(user_id, forgotten_at, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
                 """
             )
 
@@ -314,3 +324,31 @@ class MemoryStore:
             for entry in entries
         ]
         return "## STORED MEMORY\nKnown durable facts from earlier conversations:\n" + "\n".join(lines)
+
+    def get_last_active_user_id(self, *, default: str | None = None) -> str:
+        """Return the most recently identified memory user ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM memory_state WHERE key = ?",
+                (LAST_ACTIVE_MEMORY_USER_KEY,),
+            ).fetchone()
+
+        if row is None:
+            return normalize_memory_user_id(default)
+        return normalize_memory_user_id(str(row["value"]))
+
+    def set_last_active_user_id(self, user_id: str) -> str:
+        """Persist the most recently identified memory user ID."""
+        normalized_user_id = normalize_memory_user_id(user_id)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_state(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (LAST_ACTIVE_MEMORY_USER_KEY, normalized_user_id, _utcnow_iso()),
+            )
+        return normalized_user_id

@@ -128,6 +128,9 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU buildsâ€
 | `WEB_SEARCH_MODEL` | Model used for the `web_search` tool (defaults to `gpt-5-mini`). |
 | `REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S` | Timeout for opening the OpenAI realtime websocket, in seconds (defaults to `10`). |
 | `REACHY_MINI_IDLE_SESSION_TIMEOUT_S` | Auto-sleep timeout for the realtime session after inactivity, in seconds (defaults to `300`). |
+| `REACHY_MINI_ENABLE_IDLE_BEHAVIOR` | Enable or disable autonomous idle gestures like dances or emotions before sleep (defaults to `true`). |
+| `REACHY_MINI_ACTIVITY_DB_THRESHOLD` | Local mic threshold in dBFS for counting user speech as activity that keeps the session awake (defaults to `-25`). |
+| `REACHY_MINI_WAKE_DB_THRESHOLD` | Local mic threshold in dBFS for waking a sleeping realtime session again (defaults to `-35`). |
 | `REACHY_MINI_MEMORY_DB_PATH` | SQLite path for durable memory storage (defaults to `./data/reachy_memory.sqlite3`). |
 | `REACHY_MINI_MEMORY_USER_ID` | Default fallback memory identity before the user introduces themselves (defaults to `default`). |
 | `REACHY_MINI_MEMORY_PROMPT_LIMIT` | Maximum number of stored memories injected into the session prompt (defaults to `12`). |
@@ -212,6 +215,7 @@ When the `web_search` tool is enabled in the active profile, Reachy can look up 
 To reduce API cost, the realtime session no longer stays connected forever when nobody is speaking.
 
 - After `REACHY_MINI_IDLE_SESSION_TIMEOUT_S` seconds of inactivity, the live realtime connection is closed automatically.
+- Set `REACHY_MINI_ENABLE_IDLE_BEHAVIOR=false` if you want Reachy to stay still and just sleep instead of dancing or showing emotions while idle.
 - While sleeping, Reachy still monitors incoming microphone audio locally for voice activity.
 - When speech is detected again, the realtime session reconnects automatically and the conversation resumes.
 - This is voice-activity wake-up, not a keyword wakeword such as "Hey Reachy".
