@@ -286,9 +286,57 @@ def _initialize_tools() -> None:
 _initialize_tools()
 
 
+def _parse_allowed_mcp_tool_names(raw_value: str) -> list[str]:
+    """Parse a comma-separated list of remote MCP tool names."""
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
+def _build_home_assistant_mcp_tool() -> Dict[str, Any] | None:
+    """Build the optional Home Assistant remote MCP tool declaration."""
+    if not config.REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED:
+        return None
+
+    server_url = config.REACHY_MINI_HOME_ASSISTANT_MCP_URL.strip()
+    token = config.REACHY_MINI_HOME_ASSISTANT_MCP_TOKEN.strip()
+    server_label = config.REACHY_MINI_HOME_ASSISTANT_MCP_SERVER_LABEL.strip() or "home_assistant"
+    require_approval = config.REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL.strip().lower() or "never"
+
+    if not server_url or not token:
+        logger.warning(
+            "Home Assistant MCP enabled but URL or token missing; skipping remote MCP tool registration."
+        )
+        return None
+
+    if require_approval not in {"always", "never"}:
+        logger.warning(
+            "Invalid REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL=%r, falling back to 'never'.",
+            config.REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL,
+        )
+        require_approval = "never"
+
+    tool: Dict[str, Any] = {
+        "type": "mcp",
+        "server_label": server_label,
+        "server_url": server_url,
+        "headers": {"Authorization": f"Bearer {token}"},
+        "server_description": "Home Assistant MCP server for smart-home status checks and device control.",
+        "require_approval": require_approval,
+    }
+
+    allowed_tools = _parse_allowed_mcp_tool_names(config.REACHY_MINI_HOME_ASSISTANT_MCP_ALLOWED_TOOLS)
+    if allowed_tools:
+        tool["allowed_tools"] = allowed_tools
+
+    return tool
+
+
 def get_tool_specs(exclusion_list: list[str] = []) -> list[Dict[str, Any]]:
     """Get tool specs, optionally excluding some tools."""
-    return [spec for spec in ALL_TOOL_SPECS if spec.get("name") not in exclusion_list]
+    specs = [spec for spec in ALL_TOOL_SPECS if spec.get("name") not in exclusion_list]
+    home_assistant_mcp_tool = _build_home_assistant_mcp_tool()
+    if home_assistant_mcp_tool is not None:
+        specs.append(home_assistant_mcp_tool)
+    return specs
 
 
 # Dispatcher

@@ -187,6 +187,16 @@ class Config:
     REACHY_MINI_ENABLE_IDLE_BEHAVIOR = _env_flag("REACHY_MINI_ENABLE_IDLE_BEHAVIOR", True)
     REACHY_MINI_ACTIVITY_DB_THRESHOLD = _env_float("REACHY_MINI_ACTIVITY_DB_THRESHOLD", -25.0)
     REACHY_MINI_WAKE_DB_THRESHOLD = _env_float("REACHY_MINI_WAKE_DB_THRESHOLD", -35.0)
+    REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED = _env_flag("REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED", False)
+    REACHY_MINI_HOME_ASSISTANT_MCP_URL = os.getenv("REACHY_MINI_HOME_ASSISTANT_MCP_URL", "")
+    REACHY_MINI_HOME_ASSISTANT_MCP_TOKEN = os.getenv("REACHY_MINI_HOME_ASSISTANT_MCP_TOKEN", "")
+    REACHY_MINI_HOME_ASSISTANT_MCP_SERVER_LABEL = os.getenv(
+        "REACHY_MINI_HOME_ASSISTANT_MCP_SERVER_LABEL", "home_assistant"
+    )
+    REACHY_MINI_HOME_ASSISTANT_MCP_ALLOWED_TOOLS = os.getenv("REACHY_MINI_HOME_ASSISTANT_MCP_ALLOWED_TOOLS", "")
+    REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL = os.getenv(
+        "REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL", "never"
+    )
     REACHY_MINI_MEMORY_DB_PATH = os.getenv("REACHY_MINI_MEMORY_DB_PATH", "./data/reachy_memory.sqlite3")
     REACHY_MINI_MEMORY_USER_ID = os.getenv("REACHY_MINI_MEMORY_USER_ID", "default")
     REACHY_MINI_MEMORY_PROMPT_LIMIT = _env_int("REACHY_MINI_MEMORY_PROMPT_LIMIT", 12)
@@ -197,7 +207,7 @@ class Config:
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
     logger.debug(
-        "Model: %s, Web Search Model: %s, Realtime Connect Timeout: %ss, Idle Timeout: %ss, Idle Behavior: %s, Activity Threshold: %s dBFS, Wake Threshold: %s dBFS, Memory DB: %s, Memory User: %s, Memory Auto Summarize: %s, Memory Summarizer Model: %s, HF_HOME: %s, Vision Model: %s",
+        "Model: %s, Web Search Model: %s, Realtime Connect Timeout: %ss, Idle Timeout: %ss, Idle Behavior: %s, Activity Threshold: %s dBFS, Wake Threshold: %s dBFS, Home Assistant MCP Enabled: %s, Home Assistant MCP URL Set: %s, Memory DB: %s, Memory User: %s, Memory Auto Summarize: %s, Memory Summarizer Model: %s, HF_HOME: %s, Vision Model: %s",
         MODEL_NAME,
         WEB_SEARCH_MODEL,
         REACHY_MINI_REALTIME_CONNECT_TIMEOUT_S,
@@ -205,6 +215,8 @@ class Config:
         REACHY_MINI_ENABLE_IDLE_BEHAVIOR,
         REACHY_MINI_ACTIVITY_DB_THRESHOLD,
         REACHY_MINI_WAKE_DB_THRESHOLD,
+        REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED,
+        bool(REACHY_MINI_HOME_ASSISTANT_MCP_URL.strip()),
         REACHY_MINI_MEMORY_DB_PATH,
         REACHY_MINI_MEMORY_USER_ID,
         REACHY_MINI_MEMORY_AUTO_SUMMARIZE,

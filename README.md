@@ -131,6 +131,12 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU buildsâ€
 | `REACHY_MINI_ENABLE_IDLE_BEHAVIOR` | Enable or disable autonomous idle gestures like dances or emotions before sleep (defaults to `true`). |
 | `REACHY_MINI_ACTIVITY_DB_THRESHOLD` | Local mic threshold in dBFS for counting user speech as activity that keeps the session awake (defaults to `-25`). |
 | `REACHY_MINI_WAKE_DB_THRESHOLD` | Local mic threshold in dBFS for waking a sleeping realtime session again (defaults to `-35`). |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED` | Enable the optional Home Assistant remote MCP server for smart-home control (defaults to `false`). |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_URL` | Full remote MCP endpoint URL for Home Assistant. |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_TOKEN` | Access token used as `Authorization: Bearer ...` for the Home Assistant MCP endpoint. |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_SERVER_LABEL` | Tool label exposed to the model for the Home Assistant MCP server (defaults to `home_assistant`). |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_ALLOWED_TOOLS` | Optional comma-separated allowlist of Home Assistant MCP tool names. Leave empty to expose all MCP tools. |
+| `REACHY_MINI_HOME_ASSISTANT_MCP_REQUIRE_APPROVAL` | Approval mode for remote MCP calls, `never` or `always` (defaults to `never`). |
 | `REACHY_MINI_MEMORY_DB_PATH` | SQLite path for durable memory storage (defaults to `./data/reachy_memory.sqlite3`). |
 | `REACHY_MINI_MEMORY_USER_ID` | Default fallback memory identity before the user introduces themselves (defaults to `default`). |
 | `REACHY_MINI_MEMORY_PROMPT_LIMIT` | Maximum number of stored memories injected into the session prompt (defaults to `12`). |
@@ -209,6 +215,15 @@ When the `web_search` tool is enabled in the active profile, Reachy can look up 
 - It is intended for current or location-sensitive questions such as weather, news, restaurants, opening hours, events, and recommendations.
 - The assistant prompt explicitly tells the model to prefer `web_search` for fast-changing or local information.
 - Search runs through the OpenAI Responses API and uses `WEB_SEARCH_MODEL`, which defaults to `gpt-5-mini`.
+
+### Optional Home Assistant MCP integration
+
+Reachy can optionally expose a remote Home Assistant MCP server directly to the realtime model.
+
+- Set `REACHY_MINI_HOME_ASSISTANT_MCP_ENABLED=true` and provide the MCP URL plus bearer token.
+- When enabled, the Home Assistant MCP server is appended to the same tool list as Reachy's local tools.
+- The prompt also nudges the model to use Home Assistant for smart-home status checks and device control instead of guessing.
+- `REACHY_MINI_HOME_ASSISTANT_MCP_ALLOWED_TOOLS` can be used to restrict which MCP tools are visible to the model.
 
 ### RTC session sleep and wake-up
 

@@ -19,6 +19,8 @@ When the web_search tool is available and the user asks for current, local, or f
 such as weather, news, restaurants, opening hours, schedules, prices, sports, or live events, use it
 instead of guessing from memory.
 Use web_search for recommendations that depend on freshness or local availability.
+If a Home Assistant MCP server is configured, use it for smart-home status checks and device control
+instead of guessing.
 """.strip()
 GLOBAL_MEMORY_GUIDANCE = """
 
