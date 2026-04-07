@@ -22,6 +22,7 @@ def test_get_tool_specs_appends_home_assistant_mcp_when_enabled(monkeypatch: pyt
     assert mcp_specs[0]["headers"] == {"Authorization": "Bearer secret-token"}
     assert mcp_specs[0]["allowed_tools"] == ["get_state", "call_service"]
     assert mcp_specs[0]["require_approval"] == "never"
+    assert "server_description" not in mcp_specs[0]
 
 
 def test_get_tool_specs_omits_home_assistant_mcp_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

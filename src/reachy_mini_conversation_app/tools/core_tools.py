@@ -319,7 +319,6 @@ def _build_home_assistant_mcp_tool() -> Dict[str, Any] | None:
         "server_label": server_label,
         "server_url": server_url,
         "headers": {"Authorization": f"Bearer {token}"},
-        "server_description": "Home Assistant MCP server for smart-home status checks and device control.",
         "require_approval": require_approval,
     }
 

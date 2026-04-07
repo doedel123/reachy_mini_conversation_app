@@ -63,7 +63,7 @@ IMAGE_INPUT_COST_PER_1M = 5.0
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _VOICE_WAKE_ATTACK_FRAMES: Final[int] = max(2, ATTACK_FR)
-_MEMORY_SUMMARIZER_MAX_TOKENS: Final[int] = 400
+_MEMORY_SUMMARIZER_MAX_TOKENS: Final[int] = 1024
 _NOISY_OPENAI_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "response.output_audio.delta",

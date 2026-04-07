@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ':*)",
+      "Bash(grep -i mcp pyproject.toml requirements*.txt)",
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python -m pytest tests/test_home_assistant_mcp.py tests/tools/test_mcp_bridge.py -v)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m pytest tests/ -v --ignore=tests/vision)",
+      "Bash(python -m pytest tests/test_home_assistant_mcp.py tests/test_openai_realtime.py -v)",
+      "Bash(python -m pytest tests/test_home_assistant_mcp.py -v)"
+    ]
+  }
+}
